@@ -1,10 +1,15 @@
 use crate::{Document, Row, Terminal};
-use std::{env, time::{Instant, Duration}, ops::Add};
+use std::{
+    env,
+    io::Error,
+    time::{Duration, Instant},
+};
 use termion::{color, event::Key};
 
 const STATUS_FG_COLOR: color::Rgb = color::Rgb(63, 63, 63);
 const STATUS_BG_COLOR: color::Rgb = color::Rgb(239, 239, 239);
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const QUIT_TIMES: u8 = 3;
 
 #[derive(Default)]
 pub struct Position {
@@ -33,21 +38,20 @@ pub struct Editor {
     offset: Position,
     document: Document,
     status_message: StatusMessage,
+    quit_times: u8,
 }
 
 impl Editor {
     pub fn default() -> Self {
         let args: Vec<String> = env::args().collect();
-        let mut initial_message = String::from("HELP: Ctrl-Q = quit");
+        let mut initial_message = String::from("HELP: Ctrl-S = save | Ctrl-Q = quit");
 
-        let document  = if args.len() > 1 {
-            let file_name = &args[1];
-            
+        let document = if let Some(file_name)= args.get(1) {
             let doc = Document::open(&file_name);
-            if doc.is_ok() {
-                doc.unwrap()
+            if let Ok(doc) = doc {
+                doc
             } else {
-                initial_message = format!("ERR: Could not open file: {}", file_name);
+                initial_message = format!("ERR: Could not open file: {file_name}");
                 Document::default()
             }
         } else {
@@ -61,6 +65,7 @@ impl Editor {
             offset: Position::default(),
             document,
             status_message: StatusMessage::from(initial_message),
+            quit_times: QUIT_TIMES,
         }
     }
 
@@ -82,7 +87,17 @@ impl Editor {
         let pressed_key = Terminal::read_key()?;
 
         match pressed_key {
-            Key::Ctrl('x') => self.should_quit = true,
+            Key::Ctrl('q') => if self.can_quit() { self.should_quit = true } else { return Ok(()) },
+            Key::Ctrl('s') => self.save(),
+            Key::Char(c) => {
+                self.document.insert(&self.cusrsor_position, c);
+                self.move_cursor(Key::Right);
+            }
+            Key::Delete => self.document.delete(&self.cusrsor_position),
+            Key::Backspace => {
+                self.move_cursor(Key::Left);
+                self.document.delete(&self.cusrsor_position);
+            }
             Key::Up
             | Key::Down
             | Key::Left
@@ -95,6 +110,10 @@ impl Editor {
         }
 
         self.scroll();
+        if self.quit_times < QUIT_TIMES {
+            self.quit_times = QUIT_TIMES;
+            self.status_message = StatusMessage::from(String::new());
+        }
 
         Ok(())
     }
@@ -118,7 +137,7 @@ impl Editor {
         }
     }
 
-    fn refresh_screen(&self) -> Result<(), std::io::Error> {
+    fn refresh_screen(&self) -> Result<(), Error> {
         Terminal::cursor_hide();
         Terminal::cursor_position(&Position::default());
 
@@ -140,16 +159,16 @@ impl Editor {
     }
 
     fn draw_welcome_message(&self) {
-        let mut welcome_message = format!("Writer editor -- version {}", VERSION);
+        let mut welcome_message = format!("Writer editor -- version {VERSION}");
         let width = self.terminal.size().width as usize;
         let len = welcome_message.len();
         let padding = width.saturating_sub(len) / 2;
         let spaces = " ".repeat(padding.saturating_sub(1));
 
-        welcome_message = format!("~{}{}", spaces, welcome_message);
+        welcome_message = format!("~{spaces}{welcome_message}");
         welcome_message.truncate(width);
 
-        println!("{}\r", welcome_message);
+        println!("{welcome_message}\r");
     }
 
     fn draw_row(&self, row: &Row) {
@@ -158,7 +177,7 @@ impl Editor {
         let end = self.offset.x + width;
         let row = row.render(start, end);
 
-        println!("{}\r", row)
+        println!("{row}\r");
     }
 
     fn draw_rows(&self) {
@@ -193,7 +212,7 @@ impl Editor {
             Key::Up => y = y.saturating_sub(1),
             Key::Down => {
                 if y < height {
-                    y = y.saturating_add(1)
+                    y = y.saturating_add(1);
                 }
             }
             Key::Left => {
@@ -250,6 +269,11 @@ impl Editor {
     fn draw_status_bar(&self) {
         let mut status;
         let width = self.terminal.size().width as usize;
+        let modified_indicator = if self.document.is_dirty() {
+            " (modified)"
+        } else {
+            ""
+        };
         let mut file_name = "[No Name]".to_string();
 
         if let Some(name) = &self.document.file_name {
@@ -257,7 +281,10 @@ impl Editor {
             file_name.truncate(20);
         }
 
-        status = format!("{} - {} lines", file_name, self.document.len());
+        status = format!(
+            "{file_name} - {} lines{modified_indicator}",
+            self.document.len()
+        );
 
         let line_indicator = format!(
             "{}/{}",
@@ -266,15 +293,16 @@ impl Editor {
         );
 
         let len = status.len() + line_indicator.len();
-        if width > len {
-            status.push_str(&" ".repeat(width - len));
-        }
+
+        status.push_str(&" ".repeat(width.saturating_sub(len)));
 
         status.truncate(width);
 
         Terminal::set_bg_color(STATUS_BG_COLOR);
         Terminal::set_bg_color(STATUS_FG_COLOR);
-        println!("{}\r", status);
+
+        println!("{status}\r");
+
         Terminal::reset_fg_color();
         Terminal::reset_bg_color();
     }
@@ -288,6 +316,67 @@ impl Editor {
             text.truncate(self.terminal.size().width as usize);
             print!("{}", text);
         }
+    }
+
+    fn prompt(&mut self, prompt: &str) -> Result<Option<String>, Error> {
+        let mut result = String::new();
+        loop {
+            self.status_message = StatusMessage::from(format!("{prompt}{result}"));
+            self.refresh_screen()?;
+
+            match Terminal::read_key()? {
+                Key::Backspace => {
+                    result.truncate(result.len().saturating_sub(1));
+                }
+                Key::Char('\n') => break,
+                Key::Char(c) => {
+                    if !c.is_control() {
+                        result.push(c);
+                    }
+                }
+                Key::Esc => {
+                    result.truncate(0);
+                    break;
+                }
+                _ => (),
+            }
+        }
+
+        self.status_message = StatusMessage::from(String::new());
+        if result.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(result))
+    }
+
+    fn save(&mut self) {
+        if self.document.file_name.is_none() {
+            let new_name = self.prompt("Save as: ").unwrap_or(None);
+            if new_name.is_none() {
+                self.status_message = StatusMessage::from("Save aborted".to_string());
+                return;
+            }
+            self.document.file_name = new_name;
+        }
+
+        if self.document.save().is_ok() {
+            self.status_message = StatusMessage::from("File saved successfully.".to_string());
+        } else {
+            self.status_message = StatusMessage::from("Error writing file!".to_string());
+        }
+    }
+
+    fn can_quit(&mut self) -> bool {
+        if self.quit_times > 0 && self.document.is_dirty() {
+            self.status_message = StatusMessage::from(format!(
+                "WARNING! File has unsaved changes. Press Ctrl-Q {} more times to quit.",
+                self.quit_times
+            ));
+            self.quit_times -= 1;
+            return false;
+        }
+        return true;
     }
 }
 
