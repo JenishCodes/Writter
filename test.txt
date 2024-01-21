@@ -1,7 +1,7 @@
 TXT test file
 Purpose: Provide example of this file type
 Document file type: TXT
-Version: 1.0
+Versi: 1.0
 Remark:
 
 File created by https://www.online-convert.com
