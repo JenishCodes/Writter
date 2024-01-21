@@ -1,4 +1,4 @@
-use crate::{Position, Row, SearchDirection};
+use crate::{Position, Row, SearchDirection, FileType};
 use std::{
     fs,
     io::{Error, Write},
@@ -9,21 +9,26 @@ pub struct Document {
     rows: Vec<Row>,
     pub file_name: Option<String>,
     dirty: bool,
+    file_type: FileType,
 }
 
 impl Document {
     pub fn open(file_name: &str) -> Result<Self, std::io::Error> {
         let content = fs::read_to_string(file_name)?;
+        let file_type = FileType::from(file_name);
         let mut rows = Vec::new();
 
         for value in content.lines() {
-            rows.push(Row::from(value));
+            let mut row = Row::from(value);
+            row.highlight(&file_type.highlight_options(), None);
+            rows.push(row);
         }
 
         Ok(Self {
             rows,
             file_name: Some(file_name.to_string()),
             dirty: false,
+            file_type,
         })
     }
 
@@ -53,9 +58,11 @@ impl Document {
         if at.y == self.rows.len() {
             let mut row = Row::default();
             row.insert(0, c);
+            row.highlight(&self.file_type.highlight_options(), None);
             self.rows.push(row);
         } else {
             let row = &mut self.rows[at.y];
+            row.highlight(&self.file_type.highlight_options(), None);
             row.insert(at.x, c);
         }
     }
@@ -72,9 +79,11 @@ impl Document {
             let next_row = self.rows.remove(at.y + 1);
             let row = &mut self.rows[at.y];
             row.append(&next_row);
+            row.highlight(&self.file_type.highlight_options(), None);
         } else {   
             let row = &mut self.rows[at.y];
             row.delete(at.x);
+            row.highlight(&self.file_type.highlight_options(), None);
         }
     }
 
@@ -88,7 +97,11 @@ impl Document {
             return;
         }
 
-        let new_row = self.rows[at.y].split(at.x);
+        let current_row = &mut self.rows[at.y];
+        let mut new_row = current_row.split(at.x);
+
+        new_row.highlight(&self.file_type.highlight_options(), None);
+        current_row.highlight(&self.file_type.highlight_options(), None);
 
         self.rows.insert(at.y + 1, new_row);
     }
@@ -96,10 +109,14 @@ impl Document {
     pub fn save(&mut self) -> Result<(), Error> {
         if let Some(file_name) = &self.file_name {
             let mut file = fs::File::create(file_name)?;
-            for row in &self.rows {
+            self.file_type = FileType::from(file_name);
+
+            for row in &mut self.rows {
                 file.write_all(row.as_bytes())?;
                 file.write_all(b"\n")?;
+                row.highlight(self.file_type.highlight_options(), None)
             }
+
             self.dirty = false;
         }
 
@@ -148,5 +165,15 @@ impl Document {
         }
 
         None
+    }
+
+    pub fn highlight(&mut self, word: Option<&str>) {
+        for row in &mut self.rows {
+            row.highlight(&self.file_type.highlight_options(), word);
+        }
+    }
+
+    pub fn file_type(&self) -> String {
+        self.file_type.name()
     }
 }

@@ -2,11 +2,12 @@ use std::cmp;
 use termion::color;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::editor::SearchDirection;
+use crate::{editor::SearchDirection, filetype::HighlightingOptions, highlighting};
 
 #[derive(Default)]
 pub struct Row {
     string: String,
+    highlighting: Vec<highlighting::Type>,
     len: usize,
 }
 
@@ -14,6 +15,7 @@ impl From<&str> for Row {
     fn from(slice: &str) -> Self {
         Self {
             string: String::from(slice),
+            highlighting: Vec::new(),
             len: slice.graphemes(true).count(),
         }
     }
@@ -26,28 +28,38 @@ impl Row {
 
         let mut result = String::new();
 
-        for grapheme in self.string[..]
+        let mut current_highlight = &highlighting::Type::None;
+
+        for (index, grapheme) in self.string[..]
             .graphemes(true)
+            .enumerate()
             .skip(start)
             .take(end - start)
         {
             if let Some(c) = grapheme.chars().next() {
+                let highlight_type = self
+                    .highlighting
+                    .get(index)
+                    .unwrap_or(&highlighting::Type::None);
+
+                if current_highlight != highlight_type {
+                    current_highlight = highlight_type;
+                    let start_highlight =
+                        format!("{}", termion::color::Fg(highlight_type.to_color()));
+                    result.push_str(&start_highlight[..]);
+                }
+
                 if c == '\t' {
                     result.push_str("  ");
-                } else if c.is_ascii_digit() {
-                    result.push_str(
-                        &format!(
-                            "{}{}{}",
-                            color::Fg(color::Rgb(220, 163, 163)),
-                            c,
-                            color::Fg(color::Reset)
-                        )[..],
-                    )
                 } else {
                     result.push(c);
                 }
             }
         }
+
+        let end_highlight = format!("{}", termion::color::Fg(color::Reset));
+        result.push_str(&end_highlight[..]);
+
         result
     }
 
@@ -130,6 +142,7 @@ impl Row {
         Self {
             string: splitted_row,
             len: splitted_length,
+            highlighting: Vec::new(),
         }
     }
 
@@ -138,7 +151,7 @@ impl Row {
     }
 
     pub fn find(&self, query: &str, at: usize, direction: SearchDirection) -> Option<usize> {
-        if at > self.len {
+        if at > self.len || query.is_empty() {
             return None;
         }
 
@@ -176,4 +189,231 @@ impl Row {
         }
         None
     }
+
+    pub fn highlight_match(&mut self, word: Option<&str>) {
+        if let Some(word) = word {
+            if word.is_empty() {
+                return;
+            }
+
+            let mut index = 0;
+            while let Some(search_match) = self.find(word, index, SearchDirection::Forward) {
+                if let Some(next_index) =
+                    search_match.checked_add(word[..].graphemes(true).count())
+                {
+                    for i in index.saturating_add(search_match)..next_index {
+                        self.highlighting[i] = highlighting::Type::Match;
+                    }
+                    index = next_index;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    pub fn highlight_char(
+        &mut self,
+        index: &mut usize,
+        opts: &HighlightingOptions,
+        c: char,
+        chars: &[char],
+    ) -> bool {
+        if opts.characters() && c == '\'' {
+            if let Some(next_char) = chars.get(index.saturating_add(1)) {
+                let closing_index = if next_char == &'\\' {
+                    index.saturating_add(3)
+                } else {
+                    index.saturating_add(2)
+                };
+                if let Some(closing_char) = chars.get(closing_index) {
+                    if closing_char == &'\'' {
+                        for _ in 0..=closing_index.saturating_sub(*index) {
+                            self.highlighting.push(highlighting::Type::Character);
+                            *index += 1;
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    pub fn highlight_string(
+        &mut self,
+        index: &mut usize,
+        opts: &HighlightingOptions,
+        c: char,
+        chars: &[char],
+    ) -> bool {
+        if opts.strings() && c == '"' {
+            loop {
+                self.highlighting.push(highlighting::Type::String);
+
+                *index += 1;
+
+                if let Some(next_char) = chars.get(*index) {
+                    if next_char == &'"' {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            self.highlighting.push(highlighting::Type::String);
+
+            *index += 1;
+
+            return true;
+        }
+        false
+    }
+
+    pub fn highlight_number(
+        &mut self,
+        index: &mut usize,
+        opts: &HighlightingOptions,
+        c: char,
+        chars: &[char],
+    ) -> bool {
+        if opts.numbers() && c.is_ascii_digit() {
+            if *index > 0 {
+                let prev_char = chars[*index - 1];
+                if !is_separator(prev_char) {
+                    return false;
+                }
+            }
+
+            loop {
+                self.highlighting.push(highlighting::Type::Number);
+
+                *index += 1;
+
+                if let Some(next_char) = chars.get(*index) {
+                    if *next_char != '.' && !next_char.is_ascii_digit() {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    pub fn highlight_str(
+        &mut self,
+        index: &mut usize,
+        substring: &str,
+        chars: &[char],
+        hl_type: highlighting::Type,
+    ) -> bool {
+        if substring.is_empty() {
+            return false;
+        }
+
+        for (substring_index, c) in substring.chars().enumerate() {
+            if let Some(next_char) = chars.get(index.saturating_add(substring_index)) {
+                if *next_char != c {
+                    return false;
+                }
+            } else {
+                return true;
+            }
+        }
+
+        for _ in 0..substring.len() {
+            self.highlighting.push(hl_type);
+            *index += 1
+        }
+
+        true
+    }
+
+    pub fn highlight_keywords(
+        &mut self,
+        index: &mut usize,
+        chars: &[char],
+        keywords: &[String],
+        hl_type: highlighting::Type,
+    ) -> bool {
+        if *index > 0 {
+            let prev_char = chars[*index - 1];
+            if !is_separator(prev_char) {
+                return false;
+            }
+        }
+
+        for word in keywords {
+            if *index < chars.len().saturating_sub(word.len()) {
+                let next_char = chars[*index + word.len()];
+                if !is_separator(next_char) {
+                    continue;
+                }
+            }
+
+            if self.highlight_str(index, &word, chars, hl_type) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn highlight_primary_keywords(
+        &mut self,
+        index: &mut usize,
+        opts: &HighlightingOptions,
+        chars: &[char],
+    ) -> bool {
+        self.highlight_keywords(
+            index,
+            chars,
+            opts.primary_keywords(),
+            highlighting::Type::PrimaryKeywords,
+        )
+    }
+
+    fn highlight_secondary_keywords(
+        &mut self,
+        index: &mut usize,
+        opts: &HighlightingOptions,
+        chars: &[char],
+    ) -> bool {
+        self.highlight_keywords(
+            index,
+            chars,
+            opts.secondary_keywords(),
+            highlighting::Type::SecondaryKeywords,
+        )
+    }
+
+    pub fn highlight(&mut self, opts: &HighlightingOptions, word: Option<&str>) {
+        self.highlighting = Vec::new();
+
+        let chars: Vec<char> = self.string.chars().collect();
+
+        let mut index = 0;
+
+        while let Some(c) = chars.get(index) {
+            if self.highlight_char(&mut index, opts, *c, &chars)
+                || self.highlight_number(&mut index, opts, *c, &chars)
+                || self.highlight_string(&mut index, opts, *c, &chars)
+                || self.highlight_primary_keywords(&mut index, &opts, &chars)
+                || self.highlight_secondary_keywords(&mut index, &opts, &chars)
+            {
+                continue;
+            }
+            self.highlighting.push(highlighting::Type::None);
+            index += 1;
+        }
+
+        self.highlight_match(word);
+    }
+}
+
+fn is_separator(c: char) -> bool {
+    c.is_ascii_punctuation() || c.is_ascii_whitespace()
 }

@@ -304,7 +304,8 @@ impl Editor {
         );
 
         let line_indicator = format!(
-            "{}/{}",
+            "{} | {}/{}",
+            self.document.file_type(),
             self.cusrsor_position.y.saturating_add(1),
             self.document.len()
         );
@@ -313,6 +314,8 @@ impl Editor {
 
         status.push_str(&" ".repeat(width.saturating_sub(len)));
 
+        status = format!("{status}{line_indicator}");
+        
         status.truncate(width);
 
         Terminal::set_bg_color(STATUS_BG_COLOR);
@@ -430,6 +433,8 @@ impl Editor {
                     } else if moved {
                         editor.move_cursor(Key::Left);
                     }
+                    
+                    editor.document.highlight(Some(query));
                 },
             )
             .unwrap_or(None);
@@ -438,6 +443,7 @@ impl Editor {
             self.cusrsor_position = old_position;
             self.scroll();
         }
+        self.document.highlight(None);
     }
 }
 
